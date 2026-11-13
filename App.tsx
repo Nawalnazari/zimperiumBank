@@ -1,15 +1,20 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import Config from 'react-native-config';
 import { PaperProvider, MD3LightTheme } from 'react-native-paper';
 import AppNavigator from './src/navigation/AppNavigator';
 import ZDefendThreatModal from './src/components/ZDefendThreatModal';
+import LinkedLabelModal from './src/components/LinkedLabelModal';
 import {
   ZDefend,
   ZDeviceStatus,
   ZDefendThreat,
   ZDefendLicenseKeyNames,
   ZDefendLicenseKey,
+  LinkedFunctionEvent,
+  ZLinkedFunctionRegistration,
 } from 'zdefend';
+
+const LINKED_FUNCTION_LABELS = ['WARNING', 'BLOCK'];
 
 const LICENSE_KEYS = ZDefendLicenseKeyNames.values();
 const HAS_MULTIPLE_LICENSE_KEYS = LICENSE_KEYS.length > 1;
@@ -31,6 +36,8 @@ interface SecurityState {
   activeThreats: ZDefendThreat[];
   activeNewThreats: ZDefendThreat[];
   licenseKey: string;
+  blockThreats: ZDefendThreat[];
+  warningThreats: ZDefendThreat[];
 }
 
 export default function App() {
@@ -41,11 +48,17 @@ export default function App() {
     activeThreats: [],
     activeNewThreats: [],
     licenseKey: '',
+    blockThreats: [],
+    warningThreats: [],
   });
+  const linkedRegistrars = useRef<ZLinkedFunctionRegistration[]>([]);
 
   const licenseKeyName = Config.APP_ENV ?? 'No License Key Avalaible';
   const selectedKey = ZDefendLicenseKeyNames.fromString(licenseKeyName);
-  console.log('[zDefend] Available license keys:', JSON.stringify(LICENSE_KEYS));
+  console.log(
+    '[zDefend] Available license keys:',
+    JSON.stringify(LICENSE_KEYS),
+  );
   ZDefendLicenseKey.selectLicenseKey(selectedKey);
   console.log('[zDefend] Env:', Config.APP_ENV, '| License key:', selectedKey);
 
@@ -122,16 +135,69 @@ export default function App() {
       deviceStatusCallback,
     });
 
+    function mergeThreats(
+      existing: ZDefendThreat[],
+      incoming: ZDefendThreat[],
+    ): ZDefendThreat[] {
+      const seen = new Set(existing.map(t => t.UUID));
+      return [...existing, ...incoming.filter(t => !seen.has(t.UUID))];
+    }
+
+    function linkedFunc(linkedEvent: LinkedFunctionEvent) {
+      console.log('[zDefend] LinkedFunction fired:', linkedEvent.label);
+      const incoming = linkedEvent.relatedThreats ?? [];
+
+      if (linkedEvent.label === 'BLOCK') {
+        setSecurity(prev => ({
+          ...prev,
+          blockThreats: mergeThreats(prev.blockThreats, incoming),
+        }));
+      } else if (linkedEvent.label === 'WARNING') {
+        setSecurity(prev => ({
+          ...prev,
+          warningThreats: mergeThreats(prev.warningThreats, incoming),
+        }));
+      } else {
+        setModalVisible(true);
+      }
+    }
+
+    function mitigateLinkedFunc(linkedEvent: LinkedFunctionEvent) {
+      console.log('[zDefend] MitigatedLinkedFunction:', linkedEvent.label);
+    }
+
+    function setupLinkedFunction() {
+      for (const label of LINKED_FUNCTION_LABELS) {
+        const reg = ZDefend.registerLinkedFunctionV2(
+          label,
+          linkedFunc,
+          mitigateLinkedFunc,
+        );
+        if (reg != null) linkedRegistrars.current.push(reg);
+      }
+    }
+
+    setupLinkedFunction();
+
     return () => {
       registration.deregister();
+      for (const reg of linkedRegistrars.current) {
+        ZDefend.removeLinkedFunction(reg);
+      }
+      linkedRegistrars.current = [];
     };
   }, []);
+
+  const hasBlock = security.blockThreats.length > 0;
+  const hasWarning = security.warningThreats.length > 0;
 
   return (
     <PaperProvider theme={theme}>
       <AppNavigator />
+
+      {/* Normal threat modal — hidden when BLOCK or WARNING is active */}
       <ZDefendThreatModal
-        visible={modalVisible}
+        visible={modalVisible && !hasBlock && !hasWarning}
         loginStatus={security.loginStatus}
         scanProgress={security.scanProgress}
         licenseKey={security.licenseKey}
@@ -139,6 +205,26 @@ export default function App() {
         activeThreats={security.activeThreats}
         activeNewThreats={security.activeNewThreats}
         onDismiss={() => setModalVisible(false)}
+      />
+
+      {/* WARNING modal — shown only when no BLOCK is active */}
+      <LinkedLabelModal
+        visible={hasWarning && !hasBlock}
+        variant="WARNING"
+        threats={security.warningThreats}
+        onDismiss={() =>
+          setSecurity(prev => ({ ...prev, warningThreats: [] }))
+        }
+      />
+
+      {/* BLOCK modal — highest priority, shown over WARNING */}
+      <LinkedLabelModal
+        visible={hasBlock}
+        variant="BLOCK"
+        threats={security.blockThreats}
+        onDismiss={() =>
+          setSecurity(prev => ({ ...prev, blockThreats: [] }))
+        }
       />
     </PaperProvider>
   );
